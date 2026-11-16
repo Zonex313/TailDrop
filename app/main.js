@@ -22,6 +22,7 @@ const PANEL_GAP = 12;               // 面板与屏幕边缘的间距
 const ICON = 52;                    // 拖拽时先出现的小方块图标边长
 const SHADOW_PAD = 16;              // 卡片左边、上边留给阴影的透明边
 const LEAVE_MS = 220;               // 退场动画时长，播完再销毁窗口
+const COLLAPSE_MS = 380;            // 列表缩回图标的动画时长（index.html 里是 .34s），多留一点余量
 const DRAG_LEAVE_HIDE_MS = 500;     // 文件拖出面板多久后收起
 const PROBE_TICK_MS = 3000;         // 面板开着时，多久检查一次哪些设备需要 ping（单台设备 15 秒内不重复 ping）
 const WATCHDOG_MS = 60000;          // 兜底：总线万一没推消息，每分钟拉一次完整状态
@@ -52,6 +53,7 @@ let panelWantFocus = false;
 let panelWantShow = false;          // 窗口是否该显示出来（拖拽时会先建好窗口但不显示）
 let panelCardH = PANEL.minH;        // 页面量出来的卡片高度
 let leaveTimer = null;
+let collapseTimer = null;
 let receiveWin = null;
 let receiveHideTimer = null;
 let receiveClosing = false;
@@ -417,6 +419,7 @@ function expandPanel(wantFocus) {
     if (panelWin.isVisible()) panelWin.focus();
   }
   if (panelMode === 'full') return;
+  clearTimeout(collapseTimer);          // 正在缩回又拖回来了：不要再按图标大小收小
   panelMode = 'full';
   dragPanelAt = 0;                      // 文件已经拖到图标上了，松手不收
   applyPanelShape();
@@ -427,8 +430,12 @@ function expandPanel(wantFocus) {
 function collapsePanel() {
   if (!isPanelOpen() || panelMode !== 'full') return;
   panelMode = 'icon';
-  applyPanelShape();
   if (panelReady) panelWin.webContents.send('panel-mode', 'icon');
+  // 可见区域要等缩回动画播完再收小：提前收小会把还没缩完的卡片按直线切掉，留下一块背景残影
+  clearTimeout(collapseTimer);
+  collapseTimer = setTimeout(() => {
+    if (isPanelOpen() && panelMode === 'icon') applyPanelShape();
+  }, COLLAPSE_MS);
 }
 
 function hidePanel() {
@@ -628,6 +635,7 @@ function createTray() {
     globalThis.__tdPanel = {
       show: (mode) => showPanel(mode),
       expand: () => expandPanel(false),
+      collapse: () => collapsePanel(),
       hide: () => hidePanel(),
       prepare: () => scheduleShowPanel(DRAG_SHOW_DELAY_MS),
       prewarm: () => { if (panelAlive() && panelClosing) panelWin.destroy(); if (!panelAlive()) createPanelWindow('icon', false); },
