@@ -1,0 +1,637 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>TailDrop</title>
+<style>
+  :root {
+    --surface: rgba(18, 20, 24, 0.82);
+    --surface-2: rgba(255, 255, 255, 0.045);
+    --line: rgba(255, 255, 255, 0.075);
+    --line-strong: rgba(255, 255, 255, 0.14);
+    --text: rgba(240, 244, 248, 0.96);
+    --text-dim: rgba(240, 244, 248, 0.46);
+    --text-mute: rgba(240, 244, 248, 0.28);
+    --accent: #5eead4;
+    --accent-soft: rgba(94, 234, 212, 0.14);
+    --danger: #fb7185;
+    --emerald: 52, 211, 153;   /* 传输进度蒙版的翠绿色 */
+    --ease: cubic-bezier(.16, 1, .3, 1);
+    --pop: cubic-bezier(.22, 1, .36, 1);          /* 图标弹出：快速长出、平稳停住，不回弹 */
+    --expand: cubic-bezier(.2, .9, .1, 1);        /* 展开：起步快、收尾很长很柔 */
+    --icon: 52px;          /* 和 main.js 的 ICON 一致 */
+    --gap: 12px;           /* 和 main.js 的 PANEL_GAP 一致 */
+    --radius: 14px;
+    --icon-radius: 16px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  /* 窗口本身透明，看得见的只有右下角的图标或卡片 */
+  html, body {
+    width: 100%; height: 100%;
+    background: transparent;
+    overflow: hidden;
+    font-family: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+    color: var(--text);
+    user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---------- 舞台：负责阴影、弹出和退场 ---------- */
+  /* 阴影用 drop-shadow 画在外层，它会跟着里面卡片的裁剪形状走，展开时阴影也一起长大 */
+  #stage {
+    position: absolute;
+    right: var(--gap);
+    bottom: var(--gap);
+    width: 280px;
+    filter: drop-shadow(0 12px 28px rgba(0, 0, 0, .5)) drop-shadow(0 2px 6px rgba(0, 0, 0, .35));
+    /* 缩放原点钉在右下角：图标就从右下角长出来，收回去时也缩回右下角 */
+    transform-origin: 100% 100%;
+    opacity: 0;
+    transform: scale(.4);
+    /* 不用回弹曲线：回弹会让图标先长过头再缩回来，看着像从左上角落回右下角 */
+    transition: opacity .14s var(--ease), transform .3s var(--pop);
+  }
+  body[data-mode] #stage { opacity: 1; transform: none; }
+  body.leaving #stage {
+    opacity: 0;
+    transform: scale(.3);
+    transition: opacity .16s cubic-bezier(.4, 0, 1, 1), transform .2s cubic-bezier(.4, 0, 1, 1);
+  }
+
+  /* ---------- 卡片 ---------- */
+  /* 平时被裁成右下角一个图标大小的方块；展开时裁剪区域从这个方块长成整张卡片 */
+  #card {
+    position: relative;
+    min-height: 110px;
+    max-height: 420px;
+    border-radius: var(--radius);
+    overflow: hidden;
+    background:
+      radial-gradient(120% 90% at 100% 0%, rgba(94, 234, 212, 0.075), transparent 55%),
+      radial-gradient(90% 70% at 0% 100%, rgba(129, 140, 248, 0.065), transparent 60%),
+      linear-gradient(180deg, #14171c 0%, #0e1013 100%);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    display: flex;
+    flex-direction: column;
+    clip-path: inset(calc(100% - var(--icon)) 0 0 calc(100% - var(--icon)) round var(--icon-radius));
+    transition: clip-path .62s var(--expand);
+  }
+  body[data-mode="full"] #card { clip-path: inset(0 0 0 0 round var(--radius)); transition: clip-path .62s var(--expand); }
+  /* 缩回图标时比展开快一点，手感干脆 */
+  body[data-mode="icon"] #card { transition: clip-path .34s cubic-bezier(.4, 0, .2, 1); }
+
+  /* 卡片里的内容：图标阶段藏起来，展开时稍晚一点浮上来 */
+  #card > header, #card > footer, #card > #empty {
+    opacity: 0;
+    transform: translateY(6px);
+    transition: opacity .3s var(--ease), transform .45s var(--ease);
+  }
+  body[data-mode="full"] #card > header { opacity: 1; transform: none; transition-delay: .1s; }
+  body[data-mode="full"] #card > #empty { opacity: 1; transform: none; transition-delay: .16s; }
+  body[data-mode="full"] #card > footer { opacity: 1; transform: none; transition-delay: .22s; }
+
+  /* ---------- 图标 ---------- */
+  /* 图标是从右下角长出来的：图标中心就是卡片右下角那块，所以把原点也钉在右下角 */
+  #icon {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: var(--icon);
+    height: var(--icon);
+    border-radius: var(--icon-radius);
+    display: grid;
+    place-items: center;
+    pointer-events: none;
+    color: var(--accent);
+    transform-origin: 100% 100%;
+    background: radial-gradient(90% 90% at 50% 35%, rgba(94, 234, 212, .2), rgba(94, 234, 212, .03) 72%);
+    box-shadow: inset 0 0 0 1px rgba(94, 234, 212, .34), inset 0 1px 0 rgba(255, 255, 255, .08);
+    transition: opacity .2s var(--ease), transform .32s var(--ease), filter .2s var(--ease);
+  }
+  #icon svg { width: 24px; height: 24px; overflow: visible; }
+  #icon .arrow { animation: bob 1.5s ease-in-out infinite; }
+  body[data-mode="icon"] #icon { animation: breathe 1.8s ease-in-out .45s infinite; }
+  body[data-mode="full"] #icon {
+    opacity: 0;
+    transform: scale(1.35);
+    filter: blur(3px);
+  }
+  @keyframes bob { 50% { transform: translateY(2px); } }
+  @keyframes breathe {
+    50% {
+      box-shadow: inset 0 0 0 1px rgba(94, 234, 212, .6), inset 0 1px 0 rgba(255, 255, 255, .08),
+                  0 0 16px rgba(94, 234, 212, .28);
+    }
+  }
+
+  /* ---------- 头部 ---------- */
+  header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 14px 16px 8px;
+  }
+  h1 {
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  #count {
+    font-size: 11px;
+    letter-spacing: .04em;
+    color: var(--text-mute);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ---------- 设备列表 ---------- */
+  /* 不拉伸：列表有多高就多高，窗口高度由页面量出来再告诉主进程；超过上限时这里滚动 */
+  #list {
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  #list::-webkit-scrollbar { width: 0; }
+
+  .row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 9px;
+    border-radius: 10px;
+    border: 1px solid transparent;
+    transition: background .16s var(--ease), border-color .16s var(--ease);
+    animation: rowIn .3s var(--ease) both;
+  }
+  /* 图标阶段先不播，展开时一行行浮上来 */
+  body:not([data-mode="full"]) .row { animation-play-state: paused; }
+  /* 图标阶段卡片不接鼠标：拖拽事件直接落到窗口上，由窗口判断"拖到图标上了" */
+  body:not([data-mode="full"]) #card, body.leaving #card { pointer-events: none; }
+  @keyframes rowIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  .row:hover {
+    background: var(--surface-2);
+    border-color: var(--line);
+  }
+
+  /* 拖拽悬停：这是整套 UI 的视觉重心 */
+  .row.over {
+    background: var(--accent-soft);
+    border-color: rgba(94, 234, 212, 0.42);
+  }
+  .row.over .meta { padding-right: 50px; }
+
+  /* ---------- 传输进度：高亮框 + 半透明翠绿色蒙版 ---------- */
+  @property --p {
+    syntax: '<percentage>';
+    inherits: true;
+    initial-value: 0%;
+  }
+  /* 蒙版比边框往里缩 2px，和边框之间留一道细缝：
+     贴着边框时，右端的亮色会和边框糊成一条粗线，看起来像溢出了边框。
+     圆角 = 行圆角 10px − 边框 1px − 内缩 2px = 7px，和边框同心。 */
+  .row::before {
+    content: "";
+    position: absolute;
+    inset: 2px;
+    border-radius: 7px;
+    pointer-events: none;
+    background: linear-gradient(90deg, rgba(var(--emerald), .16), rgba(var(--emerald), .30));
+    clip-path: inset(0 calc(100% - var(--p)) 0 0 round 7px);
+    opacity: 0;
+    transition: opacity .3s var(--ease);
+  }
+  .row > * { position: relative; z-index: 1; }
+  .row.sending, .row.ok {
+    background: rgba(var(--emerald), .05);
+    border-color: rgba(var(--emerald), .42);
+  }
+  .row.sending::before { opacity: 1; }
+  .row.ok::before { opacity: 1; }
+  /* 进度大约每秒更新一次，用 1 秒线性过渡把两次更新之间补平；完成时快速补满 */
+  .row.sending { transition: background .16s var(--ease), border-color .16s var(--ease), --p 1s linear; }
+  .row.ok      { transition: background .16s var(--ease), border-color .16s var(--ease), --p .25s var(--ease); }
+  .row.ok.fading::before { opacity: 0; }
+  /* 还没有进度数据时（对方还没开始接收）：蒙版里有一道光缓慢扫过 */
+  .row.sending.waiting::before {
+    --p: 100%;
+    background: linear-gradient(90deg, transparent 0%, rgba(var(--emerald), .16) 50%, transparent 100%) no-repeat;
+    background-size: 40% 100%;
+    animation: sweep 1.4s linear infinite;
+  }
+  @keyframes sweep {
+    from { background-position: -60% 0; }
+    to   { background-position: 160% 0; }
+  }
+  .row.over::after {
+    content: "松手发送";
+    position: absolute;
+    right: 11px;
+    font-size: 10px;
+    letter-spacing: .1em;
+    color: var(--accent);
+    opacity: 0;
+    animation: fadeIn .18s var(--ease) .05s forwards;
+  }
+  @keyframes fadeIn { to { opacity: .95; } }
+
+  /* ---------- 头像 ---------- */
+  .avatar {
+    width: 30px; height: 30px;
+    flex: 0 0 30px;
+    border-radius: 9px;
+    display: grid;
+    place-items: center;
+    background: linear-gradient(160deg, rgba(255,255,255,.11), rgba(255,255,255,.03));
+    border: 1px solid var(--line-strong);
+    font-size: 12px;
+    font-weight: 600;
+    color: rgba(240, 244, 248, .82);
+    transition: border-color .16s var(--ease), color .16s var(--ease);
+  }
+  .row.over .avatar {
+    border-color: rgba(94, 234, 212, .55);
+    color: var(--accent);
+  }
+
+  /* ---------- 文字 ---------- */
+  .meta { flex: 1; min-width: 0; }
+  .name {
+    font-size: 13.5px;
+    font-weight: 500;
+    letter-spacing: .01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .sub {
+    margin-top: 2px;
+    font-size: 10.5px;
+    letter-spacing: .03em;
+    color: var(--text-mute);
+    font-variant-numeric: tabular-nums;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .subtext {
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .dot {
+    flex: 0 0 4px;
+    width: 4px; height: 4px;
+    border-radius: 50%;
+    background: var(--accent);
+    opacity: .8;
+  }
+  .dot.p2p   { background: #7dd3fc; }
+  .dot.relay { background: #fbbf24; }
+  .dot.unknown { background: rgba(255, 255, 255, .35); animation: dotPulse 1s ease-in-out infinite; }
+  @keyframes dotPulse { 50% { opacity: .25; } }
+
+  /* ---------- 状态 ---------- */
+  .status {
+    font-size: 10px;
+    letter-spacing: .08em;
+    color: var(--text-mute);
+    display: none;
+    flex: 0 0 auto;
+  }
+  .row.sending .status { display: block; color: rgb(var(--emerald)); font-variant-numeric: tabular-nums; }
+  .row.ok .status      { display: block; color: rgb(var(--emerald)); }
+  .row.error .status   { display: block; color: var(--danger); }
+  .row .spinner {
+    display: none;
+    width: 13px; height: 13px;
+    border-radius: 50%;
+    border: 1.5px solid rgba(94,234,212,.22);
+    border-top-color: var(--accent);
+    animation: spin .8s linear infinite;
+  }
+  .row.sending.waiting .spinner { display: block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------- 空状态 ---------- */
+  #empty {
+    flex: 0 0 auto;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 18px 16px 22px;
+    text-align: center;
+  }
+  body.is-empty #empty { display: flex; }
+  body.is-empty #list { display: none; }
+  #empty .t { font-size: 12.5px; color: var(--text-dim); }
+  #empty .s { font-size: 10.5px; color: var(--text-mute); letter-spacing: .03em; }
+
+  /* ---------- 底部 ---------- */
+  footer {
+    margin-top: auto;
+    padding: 8px 12px 10px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-top: 1px solid rgba(255, 255, 255, 0.045);
+  }
+  footer .hint {
+    font-size: 10.5px;
+    letter-spacing: .04em;
+    color: var(--text-mute);
+  }
+  #close {
+    width: 22px; height: 22px;
+    border-radius: 7px;
+    border: none;
+    background: transparent;
+    color: var(--text-mute);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    transition: background .15s var(--ease), color .15s var(--ease);
+  }
+  #close:hover { background: rgba(255,255,255,.07); color: var(--text); }
+</style>
+</head>
+<body>
+  <div id="stage">
+  <div id="card">
+    <header>
+      <h1>Send to</h1>
+      <span id="count"></span>
+    </header>
+
+    <div id="list"></div>
+
+    <div id="empty">
+      <div class="t">没有在线设备</div>
+      <div class="s">确认对方已登录同一个 Tailscale 账号</div>
+    </div>
+
+    <footer>
+      <span class="hint" id="hint">拖住文件拖到设备上松手</span>
+      <button id="close" title="关闭面板 (Esc)">✕</button>
+    </footer>
+  </div>
+  <div id="icon" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
+      <g class="arrow"><path d="M12 4v10" /><path d="M8 10l4 4 4-4" /></g>
+    </svg>
+  </div>
+  </div>
+
+<script>
+  const listEl = document.getElementById('list');
+  const emptyEl = document.getElementById('empty');
+  const headerEl = document.querySelector('header');
+  const footerEl = document.querySelector('footer');
+  const countEl = document.getElementById('count');
+  const hintEl = document.getElementById('hint');
+  const DEFAULT_HINT = hintEl.textContent;
+  const SHOW_FALLBACK_MS = 1500;   // 一直拿不到设备数据时，多久后显示空状态
+
+  const osLabel = { windows: 'Windows', android: 'Android', macos: 'macOS', linux: 'Linux', ios: 'iOS' };
+  const linkLabel = { lan: '局域网直连', p2p: '公网直连', relay: '经中转' };
+  const LINK_UNKNOWN = '正在测线路';   // 还没测出真实线路时不写"经中转"，免得一闪一闪地误导
+
+  let devices = [];
+  let lastKey = null;
+  let wantMode = null;             // 主进程要的样子：'icon' 小图标 / 'full' 完整列表
+  let fitted = false;              // 主进程是否已经按量好的高度把窗口显示出来
+  let revealed = false;            // 窗口是否已经真正出现在屏幕上
+  const rows = new Map();          // 设备 id -> 行元素，刷新时原地更新，不重建
+
+  // ---------- 渲染 ----------
+
+  function createRow(d, index) {
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.dataset.id = d.id;
+    // 展开时卡片先长出来，行再一行行浮上来
+    row.style.animationDelay = `${140 + Math.min(index * 40, 240)}ms`;
+    row.innerHTML = `
+      <div class="avatar"></div>
+      <div class="meta">
+        <div class="name"></div>
+        <div class="sub"><span class="dot"></span><span class="subtext"></span></div>
+      </div>
+      <div class="spinner"></div>
+      <div class="status"></div>
+    `;
+    return row;
+  }
+
+  function updateRow(row, d) {
+    const known = !!(d.link && d.link.confirmed);
+    const kind = known ? d.link.kind : 'unknown';
+    row.querySelector('.avatar').textContent = (d.name || '?').trim().charAt(0).toUpperCase();
+    row.querySelector('.name').textContent = d.name || '(未命名)';
+    row.querySelector('.dot').className = `dot ${kind}`;
+    row.querySelector('.subtext').textContent =
+      [osLabel[d.os] || d.os || '设备', known ? linkLabel[kind] : LINK_UNKNOWN, d.addr].filter(Boolean).join(' · ');
+  }
+
+  function render() {
+    document.body.classList.toggle('is-empty', devices.length === 0);
+    countEl.textContent = devices.length ? `${devices.length} 台在线` : '';
+
+    const keep = new Set();
+    devices.forEach((d, i) => {
+      let row = rows.get(d.id);
+      if (!row) {
+        row = createRow(d, i);
+        rows.set(d.id, row);
+      }
+      updateRow(row, d);
+      keep.add(d.id);
+      // 只在位置不对时才移动节点：移动会让入场动画重播
+      if (listEl.children[i] !== row) listEl.insertBefore(row, listEl.children[i] || null);
+    });
+    for (const [id, row] of rows) {
+      if (!keep.has(id)) { row.remove(); rows.delete(id); }
+    }
+  }
+
+  // 量出卡片的自然高度告诉主进程（主进程据此调整可点区域）
+  function fit() {
+    const body = devices.length ? listEl.scrollHeight : emptyEl.offsetHeight;
+    return window.api.fit(Math.ceil(headerEl.offsetHeight + body + footerEl.offsetHeight));
+  }
+
+  async function update() {
+    render();
+    await fit();
+    fitted = true;
+    applyMode();
+  }
+
+  // 切换图标/列表。直接打开列表时，要等窗口真正显示出来再播动画，否则动画在看不见的时候就播完了。
+  // 连等两帧，保证切换前的样子已经画出来过，过渡动画才有起点。
+  function applyMode() {
+    if (!wantMode || document.body.dataset.mode === wantMode) return;
+    // 第一次出场必须等窗口真正显示：窗口是在幕后提前建好的，
+    // 不等的话入场动画在看不见的时候就播完了，显示出来那一下就成了"跳出来"
+    if (!document.body.dataset.mode && !revealed) return;
+    if (wantMode === 'full' && !document.body.dataset.mode && !fitted) return;
+    const target = wantMode;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (wantMode === target) document.body.dataset.mode = target;
+    }));
+  }
+
+  window.api.onPanelMode((m) => {
+    if (m === wantMode) return;
+    wantMode = m;
+    applyMode();
+  });
+
+  window.api.onPanelLeave(() => document.body.classList.add('leaving'));
+  window.api.onPanelReveal(() => { revealed = true; applyMode(); });
+
+  // 主进程会先发缓存、再定期发最新状态；内容没变就什么都不做
+  window.api.onDevices((d) => {
+    const key = JSON.stringify(d);
+    if (key === lastKey) return;
+    lastKey = key;
+    devices = d;
+    update();
+  });
+
+  setTimeout(() => { if (lastKey === null) update(); }, SHOW_FALLBACK_MS);
+
+  // ---------- 拖放 ----------
+  // 高亮按"鼠标此刻在哪一行"判断，而不是逐行监听进出：
+  // 行里有头像、名字等子元素，鼠标在它们之间移动会不停触发"离开"，导致高亮闪烁。
+
+  let overRow = null;
+  let dragDepth = 0;
+
+  function setOver(row) {
+    if (row === overRow) return;
+    if (overRow) overRow.classList.remove('over');
+    overRow = row;
+    if (row) row.classList.add('over');
+  }
+
+  function rowAt(e) {
+    return e.target instanceof Element ? e.target.closest('.row') : null;
+  }
+
+  // 新版 Electron 的 File 对象没有 .path，只能通过 preload 暴露的 webUtils.getPathForFile 拿
+  function collectPaths(e) {
+    const out = [];
+    for (const f of e.dataTransfer.files) {
+      const p = window.api.getPath(f);
+      if (p) out.push(p);
+    }
+    return out;
+  }
+
+  window.addEventListener('dragenter', (e) => { e.preventDefault(); dragDepth++; });
+
+  window.addEventListener('dragover', (e) => {
+    e.preventDefault();
+    window.api.dragOverPanel();
+    setOver(rowAt(e));
+  });
+
+  window.addEventListener('dragleave', () => {
+    if (--dragDepth > 0) return;     // 只是在子元素之间移动
+    dragDepth = 0;
+    setOver(null);
+    window.api.dragLeavePanel();
+  });
+
+  window.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    dragDepth = 0;
+    const row = rowAt(e);
+    setOver(null);
+    if (!row) return;
+    const files = collectPaths(e);
+    if (!files.length) return;
+    setProgress(row, null);
+    await window.api.send(files, row.dataset.id);
+  });
+
+  // ---------- 发送进度 ----------
+  // 事件：progress（pct 为 0~1，未知时为 null）/ ok / error
+
+  const fadeTimers = new Map();
+
+  function fmtSpeed(bps) {
+    if (!bps || bps < 1) return '';
+    const u = ['B', 'KB', 'MB', 'GB'];
+    let i = 0, v = bps;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}/s`;
+  }
+
+  function setProgress(row, pct, speed) {
+    const st = row.querySelector('.status');
+    row.classList.remove('ok', 'error', 'fading');
+    row.classList.add('sending');
+    row.classList.toggle('waiting', pct == null);
+    const sp = fmtSpeed(speed);
+    if (pct == null) {
+      st.textContent = '发送中';
+      return;
+    }
+    row.style.setProperty('--p', `${(pct * 100).toFixed(1)}%`);
+    st.textContent = sp ? `${Math.floor(pct * 100)}% · ${sp}` : `${Math.floor(pct * 100)}%`;
+  }
+
+  window.api.onSendProgress(({ devId, state, pct, speed, label, message }) => {
+    const row = rows.get(devId);
+    if (!row) return;
+    clearTimeout(fadeTimers.get(devId));
+    const st = row.querySelector('.status');
+
+    if (state === 'progress') return setProgress(row, pct, speed);
+
+    row.classList.remove('sending', 'waiting');
+    if (state === 'ok') {
+      row.classList.add('ok');
+      row.style.setProperty('--p', '100%');
+      st.textContent = '已送达';
+      hintEl.textContent = `${label} 已发送`;
+      fadeTimers.set(devId, setTimeout(() => {
+        row.classList.add('fading');
+        fadeTimers.set(devId, setTimeout(() => {
+          row.classList.remove('ok', 'fading');
+          row.style.removeProperty('--p');
+          hintEl.textContent = DEFAULT_HINT;
+        }, 300));
+      }, 2300));
+    }
+    if (state === 'error') {
+      row.classList.add('error');
+      row.style.removeProperty('--p');
+      st.textContent = '失败';
+      hintEl.textContent = `发送失败：${(message || '').slice(0, 40)}`;
+      fadeTimers.set(devId, setTimeout(() => row.classList.remove('error'), 4000));
+    }
+  });
+
+  document.getElementById('close').addEventListener('click', () => window.api.hide());
+  window.addEventListener('keydown', (e) => { if (e.key === 'Escape') window.api.hide(); });
+</script>
+</body>
+</html>

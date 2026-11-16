@@ -1,0 +1,202 @@
+// 发送队列 + 实时进度
+//
+// 进度来源：tailscaled 在发文件时，会在内部消息总线上每秒广播一次"已发出多少字节"
+// （官方命令行显示进度用的也是这个数据）。总线由 bus.js 统一维护，这里只订阅。
+// 读不到广播时照常发送，只是界面上没有百分比。
+
+const { spawn } = require('child_process');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { postProgress } = require('./notify');
+
+const SPEED_ALPHA = 0.35;                 // 速度平滑系数：越大越灵敏、越跳
+const STALL_MS = 60 * 1000;               // 有进度数据时：这么久没多发出一个字节，就判定对方没响应
+const BLIND_TIMEOUT_MS = 30 * 60 * 1000;  // 完全读不到进度时的兜底超时
+const PUSH_EVERY_MS = 1000;               // 给对方 TailDrop 推进度的间隔
+const PUSH_GIVE_UP = 3;                   // 连续推不过去几次就放弃（对方没装 TailDrop）
+
+function createSender(tailscaleExe, bus, emit) {
+  const queue = [];
+  let busy = false;
+  let current = null;     // 正在发送的任务，面板重新打开时用来恢复进度显示
+
+  function enqueue(files, dev) {
+    if (!dev || !files.length) return false;
+    queue.push({ files: files.slice(), dev });
+    pump();
+    return true;
+  }
+
+  async function pump() {
+    if (busy) return;
+    busy = true;
+    const unsubscribe = bus.subscribe(onMessage);
+    bus.start();
+    try {
+      while (queue.length) await runJob(queue.shift());
+    } finally {
+      unsubscribe();
+      bus.stop();
+      busy = false;
+      current = null;
+    }
+  }
+
+  async function runJob({ files, dev }) {
+    const sizes = files.map(fileSize);
+    const total = sizes.reduce((a, b) => a + b, 0);
+    const job = { dev, total, doneBytes: 0, file: null, sent: 0, speed: 0, lastSentAt: 0, lastSentBytes: 0, seen: false, lastAdvance: 0 };
+    job.push = createPush(dev, files, sizes);
+    current = job;
+    report(job);
+
+    let firstError = null;
+    for (let i = 0; i < files.length; i++) {
+      Object.assign(job, { index: i, file: files[i], sent: 0, speed: 0, lastSentAt: 0, lastSentBytes: 0, seen: false, lastAdvance: Date.now() });
+      job.push.update(job, true);
+      try {
+        await sendOne(job);
+      } catch (e) {
+        firstError = firstError || e;
+        job.push.fail(i);
+      }
+      job.doneBytes += sizes[i];
+      report(job);
+    }
+
+    await job.push.finish(firstError ? 'error' : 'ok');
+    const label = files.length === 1 ? path.basename(files[0]) : `${files.length} 个文件`;
+    if (firstError) emit({ devId: dev.id, state: 'error', label, message: firstError.message });
+    else emit({ devId: dev.id, state: 'ok', label, queueEmpty: queue.length === 0 });
+  }
+
+  function sendOne(job) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(tailscaleExe, ['file', 'cp', job.file, `${job.dev.dnsName}:`], { windowsHide: true });
+      let stderr = '';
+      child.stderr.on('data', (d) => { stderr += d; });
+
+      const started = Date.now();
+      const watchdog = setInterval(() => {
+        const now = Date.now();
+        const stalled = job.seen ? now - job.lastAdvance > STALL_MS : now - started > BLIND_TIMEOUT_MS;
+        if (stalled) {
+          clearInterval(watchdog);
+          child.kill();
+          reject(new Error('对方没有响应，已停止发送'));
+        }
+      }, 1000);
+
+      child.on('error', (e) => { clearInterval(watchdog); reject(e); });
+      child.on('close', (code) => {
+        clearInterval(watchdog);
+        if (code === 0) resolve();
+        else reject(new Error(lastLine(stderr) || `tailscale 退出码 ${code}`));
+      });
+    });
+  }
+
+  // 总线消息：只关心发送进度（OutgoingFiles），且只认当前这台设备、当前这个文件、还没结束的那条
+  function onMessage(msg) {
+    const job = current;
+    if (!job || !job.file) return;
+    for (const of of msg.OutgoingFiles || []) {
+      if (of.Finished || of.PeerID !== job.dev.id) continue;
+      if (decodeName(of.Name) !== path.basename(job.file)) continue;
+      job.seen = true;
+      if (of.Sent > job.sent) {
+        const now = Date.now();
+        if (job.lastSentAt) {
+          const dt = (now - job.lastSentAt) / 1000;
+          if (dt > 0.2) {
+            const instant = (of.Sent - job.lastSentBytes) / dt;
+            job.speed = job.speed ? job.speed * (1 - SPEED_ALPHA) + instant * SPEED_ALPHA : instant;
+          }
+        }
+        job.lastSentAt = now;
+        job.lastSentBytes = of.Sent;
+        job.sent = of.Sent;
+        job.lastAdvance = now;
+        report(job);
+      }
+    }
+  }
+
+  function report(job) {
+    emit({ devId: job.dev.id, state: 'progress', pct: progressOf(job), speed: job.speed || 0 });
+    if (job.push) job.push.update(job);
+  }
+
+  // 面板重新打开时调用，拿到"正在发送"的最新状态
+  function snapshot() {
+    return current ? { devId: current.dev.id, state: 'progress', pct: progressOf(current), speed: current.speed || 0 } : null;
+  }
+
+  return { enqueue, snapshot };
+}
+
+// 对方也是装了 TailDrop 的 Windows 电脑时，把进度推给它，让它的接收条显示文件名和百分比。
+// 推送失败不影响发送本身。
+function createPush(dev, files, sizes) {
+  const enabled = dev.os === 'windows' && !!dev.addr;
+  const base = {
+    v: 1,
+    id: crypto.randomUUID(),
+    from: os.hostname(),
+    files: files.map((f, i) => ({ name: path.basename(f), size: sizes[i] })),
+  };
+  const failed = [];
+  let fails = 0;
+  let lastAt = 0;
+  let inflight = null;
+  let last = { cur: 0, sent: 0, speed: 0 };
+
+  function post(state) {
+    if (!enabled || fails >= PUSH_GIVE_UP) return Promise.resolve();
+    const p = postProgress(dev.addr, { ...base, ...last, state, failed: failed.slice() })
+      .then((ok) => { fails = ok ? 0 : fails + 1; });
+    inflight = p.finally(() => { if (inflight === p) inflight = null; });
+    return p;
+  }
+
+  return {
+    update(job, force = false) {
+      last = { cur: job.index || 0, sent: job.sent || 0, speed: Math.round(job.speed || 0) };
+      const now = Date.now();
+      if (inflight || (!force && now - lastAt < PUSH_EVERY_MS)) return;
+      lastAt = now;
+      post('progress');
+    },
+    fail(i) { failed.push(i); },
+    async finish(state) {
+      if (inflight) await inflight;
+      last = { ...last, cur: base.files.length - 1, sent: base.files[base.files.length - 1].size };
+      await post(state);
+    },
+  };
+}
+
+// 0~1；总大小未知或还没开始传时返回 null（界面显示为"发送中"）
+function progressOf(job) {
+  if (!job.total) return null;
+  const done = job.doneBytes + Math.min(job.sent, job.total);
+  if (done === 0) return null;
+  return Math.min(1, done / job.total);
+}
+
+function fileSize(f) {
+  try { return fs.statSync(f).size; } catch { return 0; }
+}
+
+// 总线里的文件名是 URL 编码的（中文会变成 %E6%B5%8B…）
+function decodeName(name) {
+  try { return decodeURIComponent(name); } catch { return name; }
+}
+
+function lastLine(s) {
+  return String(s).trim().split(/\r?\n/).filter(Boolean).pop() || '';
+}
+
+module.exports = { createSender };

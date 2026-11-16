@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>TailDrop 接收</title>
+<style>
+  :root {
+    --text: rgba(240, 244, 248, 0.96);
+    --text-dim: rgba(240, 244, 248, 0.46);
+    --text-mute: rgba(240, 244, 248, 0.28);
+    --line-strong: rgba(255, 255, 255, 0.14);
+    --emerald: 52, 211, 153;
+    --ease: cubic-bezier(.16, 1, .3, 1);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    width: 100%; height: 100%;
+    background: #0e1013;
+    overflow: hidden;
+    font-family: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+    color: var(--text);
+    user-select: none;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  #card {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(120% 90% at 100% 0%, rgba(94, 234, 212, 0.075), transparent 55%),
+      linear-gradient(180deg, #14171c 0%, #0e1013 100%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.055);
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+    transform: translateY(8px) scale(.985);
+    transition: opacity .18s var(--ease), transform .22s var(--ease);
+  }
+  body.ready #card { opacity: 1; transform: none; }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 8px 4px 14px;
+    min-height: 34px;
+  }
+  .tools { display: flex; gap: 2px; flex: 0 0 auto; }
+  .tool {
+    width: 24px; height: 24px;
+    display: grid;
+    place-items: center;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--text-mute);
+    cursor: pointer;
+    transition: background .15s var(--ease), color .15s var(--ease);
+  }
+  .tool svg { width: 14px; height: 14px; display: block; }
+  .tool:hover { background: rgba(255,255,255,.07); color: var(--text); }
+  .tool:active { background: rgba(255,255,255,.11); }
+  #open:hover { color: rgb(var(--emerald)); background: rgba(var(--emerald), .10); }
+  h1 {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: rgb(var(--emerald));
+    opacity: .85;
+  }
+  #from {
+    flex: 1;
+    min-width: 0;
+    font-size: 10.5px;
+    letter-spacing: .03em;
+    color: var(--text-mute);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
+  }
+
+  #list {
+    flex: 0 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  #list::-webkit-scrollbar { width: 0; }
+
+  /* ---------- 文件行：半透明翠绿色蒙版 = 进度 ---------- */
+  @property --p {
+    syntax: '<percentage>';
+    inherits: true;
+    initial-value: 0%;
+  }
+  .row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: 10px;
+    border: 1px solid rgba(var(--emerald), .42);
+    background: rgba(var(--emerald), .05);
+    animation: rowIn .3s var(--ease) both;
+  }
+  @keyframes rowIn {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: none; }
+  }
+  .row::before {
+    content: "";
+    position: absolute;
+    inset: 2px;
+    border-radius: 7px;
+    pointer-events: none;
+    background: linear-gradient(90deg, rgba(var(--emerald), .16), rgba(var(--emerald), .30));
+    clip-path: inset(0 calc(100% - var(--p)) 0 0 round 7px);
+    opacity: 1;
+    transition: --p 1s linear;
+  }
+  .row.done::before { transition: --p .25s var(--ease), opacity .6s var(--ease); opacity: .55; }
+  .row > * { position: relative; z-index: 1; }
+
+  .row.waiting::before {
+    --p: 100%;
+    background: linear-gradient(90deg, transparent 0%, rgba(var(--emerald), .16) 50%, transparent 100%) no-repeat;
+    background-size: 40% 100%;
+    animation: sweep 1.4s linear infinite;
+  }
+  @keyframes sweep {
+    from { background-position: -60% 0; }
+    to   { background-position: 160% 0; }
+  }
+
+  .avatar {
+    width: 28px; height: 28px;
+    flex: 0 0 28px;
+    border-radius: 9px;
+    display: grid;
+    place-items: center;
+    background: linear-gradient(160deg, rgba(255,255,255,.11), rgba(255,255,255,.03));
+    border: 1px solid rgba(var(--emerald), .45);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: rgb(var(--emerald));
+  }
+
+  .meta { flex: 1; min-width: 0; }
+  .name {
+    font-size: 13px;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .sub {
+    margin-top: 2px;
+    font-size: 10.5px;
+    letter-spacing: .03em;
+    color: var(--text-mute);
+    font-variant-numeric: tabular-nums;
+    display: flex;
+    gap: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .sub .sep { opacity: .5; }
+
+  .right {
+    flex: 0 0 auto;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .pct {
+    font-size: 12px;
+    font-weight: 600;
+    color: rgb(var(--emerald));
+    letter-spacing: .02em;
+  }
+  .speed {
+    margin-top: 2px;
+    font-size: 10px;
+    color: var(--text-mute);
+    letter-spacing: .02em;
+  }
+  .row.done .speed { color: rgb(var(--emerald)); opacity: .8; }
+
+  .row.failed { border-color: rgba(248, 113, 113, .45); background: rgba(248, 113, 113, .05); }
+  .row.failed::before { opacity: 0; }
+  .row.failed .pct { color: rgb(248, 113, 113); }
+  .row.failed .avatar { border-color: rgba(248, 113, 113, .45); color: rgb(248, 113, 113); }
+</style>
+</head>
+<body>
+  <div id="card">
+    <header>
+      <h1 id="title">Receiving</h1>
+      <span id="from"></span>
+      <div class="tools">
+        <button class="tool" id="open" title="打开接收文件夹">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">
+            <path d="M1.75 4.25a1 1 0 0 1 1-1h3.1l1.4 1.5h6a1 1 0 0 1 1 1v6.5a1 1 0 0 1-1 1H2.75a1 1 0 0 1-1-1z"/>
+            <path d="M1.75 6.75h12.5"/>
+          </svg>
+        </button>
+        <button class="tool" id="close" title="关闭">
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+            <path d="M4.5 4.5l7 7M11.5 4.5l-7 7"/>
+          </svg>
+        </button>
+      </div>
+    </header>
+    <div id="list"></div>
+  </div>
+
+<script>
+  const listEl = document.getElementById('list');
+  const fromEl = document.getElementById('from');
+  const titleEl = document.getElementById('title');
+
+  const osLabel = { windows: 'Windows', android: 'Android', macos: 'macOS', linux: 'Linux', ios: 'iOS' };
+  // 接收条比发送面板窄，线路用短标注，设备名由标题栏负责
+  const linkLabel = { lan: '局域网', p2p: '公网', relay: '中转' };
+
+  let rows = new Map();
+  let revealed = false;
+  let showedDoneAt = 0;
+
+  function fmtSize(n) {
+    if (!n) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${u[i]}`;
+  }
+
+  // 窄卡片里用紧凑写法：14MB 而不是 14 MB
+  function fmtSizeTight(n) {
+    return fmtSize(n).replace(' ', '');
+  }
+
+  function fmtSpeed(bps) {
+    if (!bps || bps < 1) return '';
+    return `${fmtSize(bps)}/s`;
+  }
+
+  // ---------- 渲染 ----------
+
+  function createRow() {
+    const row = document.createElement('div');
+    row.className = 'row waiting';
+    row.innerHTML = `
+      <div class="avatar"></div>
+      <div class="meta">
+        <div class="name"></div>
+        <div class="sub"></div>
+      </div>
+      <div class="right">
+        <div class="pct">接收中</div>
+        <div class="speed"></div>
+      </div>
+    `;
+    return row;
+  }
+
+  function render(list) {
+    const keep = new Set();
+    list.forEach((f, i) => {
+      const key = f.key || f.name;
+      keep.add(key);
+      let row = rows.get(key);
+      if (!row) { row = createRow(); rows.set(key, row); }
+
+      const peer = f.peer || {};
+      row.querySelector('.avatar').textContent = peer.name ? peer.name.charAt(0).toUpperCase() : '↓';
+
+      row.querySelector('.name').textContent = f.name;
+
+      const parts = [];
+      if (peer.os) parts.push(osLabel[peer.os] || peer.os);
+      if (peer.link && peer.link.confirmed !== false) parts.push(linkLabel[peer.link.kind] || '');
+      if (f.done || f.failed || f.unknown) {
+        // 传完了 / 文件名未知：大小显示在右侧，副标题不再重复
+      } else if (f.size) {
+        parts.push(`${fmtSizeTight(f.received || 0)}/${fmtSizeTight(f.size)}`);
+      } else if (f.received) {
+        parts.push(fmtSizeTight(f.received));
+      }
+      row.querySelector('.sub').textContent = parts.filter(Boolean).join(' · ');
+
+      const pctEl = row.querySelector('.pct');
+      const speedEl = row.querySelector('.speed');
+      if (f.failed) {
+        row.classList.remove('waiting', 'done');
+        row.classList.add('failed');
+        pctEl.textContent = '失败';
+        speedEl.textContent = fmtSize(f.size || 0);
+      } else if (f.done) {
+        row.classList.remove('waiting');
+        row.classList.add('done');
+        row.style.setProperty('--p', '100%');   // 收完了：蒙版补满，再淡一点
+        pctEl.textContent = '已接收';
+        speedEl.textContent = fmtSize(f.size || f.received || 0);
+      } else if (f.unknown) {
+        // 手机发来的：Tailscale 中途不告诉文件名和总大小，只显示已收多少 + 速度
+        row.classList.add('waiting');
+        pctEl.textContent = fmtSizeTight(f.received || 0);
+        speedEl.textContent = fmtSpeed(f.speed);
+      } else if (f.pct == null) {
+        // 总大小还不知道：进度条不确定，但速度是真实的
+        row.classList.add('waiting');
+        pctEl.textContent = '接收中';
+        speedEl.textContent = fmtSpeed(f.speed);
+      } else {
+        row.classList.remove('waiting');
+        row.style.setProperty('--p', `${(f.pct * 100).toFixed(1)}%`);
+        pctEl.textContent = `${Math.round(f.pct * 100)}%`;
+        speedEl.textContent = fmtSpeed(f.speed);
+      }
+
+      if (listEl.children[i] !== row) listEl.insertBefore(row, listEl.children[i] || null);
+    });
+    for (const [key, row] of rows) {
+      if (!keep.has(key)) { row.remove(); rows.delete(key); }
+    }
+
+    // 标题栏显示发送方：多台设备同时发时只写"N 台设备"；不知道是谁就不写
+    const senders = [...new Set(list.map((f) => (f.peer && f.peer.name) || '').filter(Boolean))];
+    fromEl.textContent = senders.length === 1 ? `from ${senders[0]}` : senders.length > 1 ? `${senders.length} 台设备` : '';
+    titleEl.textContent = list.every((f) => f.done || f.failed) ? 'Received' : 'Receiving';
+
+    if (list.some((f) => f.done)) showedDoneAt = Date.now();
+  }
+
+  function fit() {
+    const head = document.querySelector('header').offsetHeight;
+    return window.api.fitReceive(Math.ceil(head + listEl.scrollHeight + 2));
+  }
+
+  function update(list) {
+    render(list);
+    fit();
+    if (!revealed && list.length) {
+      revealed = true;
+      requestAnimationFrame(() => document.body.classList.add('ready'));
+    }
+  }
+
+  window.api.onReceiveProgress(update);
+  document.getElementById('open').addEventListener('click', () => window.api.openReceiveDir());
+  document.getElementById('close').addEventListener('click', () => window.api.hideReceive());
+</script>
+</body>
+</html>
