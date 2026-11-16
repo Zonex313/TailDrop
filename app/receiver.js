@@ -27,6 +27,9 @@ const PUSH_STALE_MS = 15000;             // 推送方这么久没消息 → 当�
 const PUSH_QUIET_MS = 3000;              // 推送刚结束的这段时间，硬盘计数不另起一行
 const CLAIM_KEEP_MS = 2 * 60 * 1000;     // 推送过的文件名记多久（防止完成通知再显示一遍）
 const BOOT_IGNORE_MS = 3000;             // 刚启动时总线可能带出旧记录，忽略
+// 完成通知常常比写盘计数先到（小文件不到 1 秒就收完）：通知到时还没被计数的那部分字节，
+// 之后几拍里看到时要先抵掉，不能当成"又来了一个新文件"
+const CREDIT_MS = 3000;
 const MAX_DONE_ROWS = 30;
 const MAX_SEEN = 500;
 
@@ -42,6 +45,8 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
   let lastNet = 0;
   let idleNets = [];               // 空闲时每拍的写入量，用来估算"平时写多少"
   let lastPushAt = 0;
+  let credit = 0;                  // 已经收完、但写盘计数还没看到的字节
+  let creditAt = 0;
   let lastSig = '[]';
   let bootAt = 0;
   let timer = null;
@@ -84,10 +89,18 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
       return;
     }
 
-    const extra = Math.max(0, net - noiseFloor());   // 超出平时的部分才算接收
+    let extra = Math.max(0, net - noiseFloor());   // 超出平时的部分才算接收
+
+    // 先抵掉"已经收完的文件"剩下的那部分
+    if (credit > 0 && now - creditAt > CREDIT_MS) credit = 0;
+    const paid = Math.min(credit, extra);
+    if (paid > 0) {
+      credit -= paid;
+      extra -= paid;
+      dbg.log('credit paid', paid, 'left', credit);
+    }
 
     if (disk) {
-      if (disk.skipTicks > 0) { disk.skipTicks--; return; }
       disk.received += extra;
       disk.samples.push({ t: now, c: disk.received });
       while (disk.samples.length > 2 && now - disk.samples[0].t > SPEED_WINDOW_MS) disk.samples.shift();
@@ -97,6 +110,7 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
       return;
     }
 
+    if (paid > 0) { streak = 0; return; }   // 这一拍是上一个文件的尾巴：不算平时写入，也不算新开始
     learnNoise(net);
     if (now - bootAt < WARMUP_MS) return;
     streak = extra >= START_BYTES ? streak + 1 : 0;
@@ -164,13 +178,15 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
       dbg.log('bus done', name, size);
       if (isClaimed(name)) continue;   // 电脑→电脑已经显示过了
 
+      // 这个文件还有多少字节没被计数（通知比计数先到）：记账，之后看到时抵掉
+      const counted = disk ? disk.received : 0;
+      credit += Math.max(0, size - counted);
+      creditAt = Date.now();
       if (disk) {
         // 这个文件收完了：进行中的计数从零开始数下一个，没动静之前先不显示
         disk.received = 0;
         disk.samples = [{ t: Date.now(), c: 0 }];
         disk.between = true;
-        // 完成通知比写盘计数早到：下一拍里还有这个文件的最后一块，不能算到下一个文件头上
-        disk.skipTicks = 1;
       }
       if (disk && disk.muted) continue;   // 这一轮被手动关掉了，传完也不再弹
       addDone({ key: `done:${key}`, name, size, peer: disk ? disk.peer : guessPeer() });
