@@ -20,7 +20,6 @@ const DRAG_SHOW_DELAY_MS = 0;       // 检测到拖拽后不再额外等待：�
 const PANEL = { w: 280, minH: 110, maxH: 420 };   // 高度随设备数量自动伸缩，超过上限就滚动
 const PANEL_GAP = 12;               // 面板与屏幕边缘的间距
 const ICON = 52;                    // 拖拽时先出现的小方块图标边长
-const SHADOW_PAD = 16;              // 卡片左边、上边留给阴影的透明边
 const LEAVE_MS = 220;               // 退场动画时长，播完再销毁窗口
 const COLLAPSE_MS = 380;            // 列表缩回图标的动画时长（index.html 里是 .34s），多留一点余量
 const DRAG_LEAVE_HIDE_MS = 500;     // 文件拖出面板多久后收起
@@ -85,8 +84,8 @@ function initTailscale() {
 // 用 setShape 把可点区域限定在图标或卡片上，其余透明部分鼠标、拖拽都直接穿透到下面。
 function panelFrame() {
   const { workArea } = screen.getPrimaryDisplay();
-  const width = PANEL.w + SHADOW_PAD + PANEL_GAP;
-  const height = PANEL.maxH + SHADOW_PAD + PANEL_GAP;
+  const width = PANEL.w + PANEL_GAP;
+  const height = PANEL.maxH + PANEL_GAP;
   return {
     x: workArea.x + workArea.width - width,
     y: workArea.y + workArea.height - height,
@@ -107,13 +106,12 @@ function panelVisibleRect(mode = panelMode) {
   return { x: f.width - PANEL_GAP - w, y: f.height - PANEL_GAP - h, width: w, height: h };
 }
 
-// 可点区域 = 看得见的那块 + 阴影边，一直延伸到窗口右下角
+// 可点区域 = 看得见的那块，一直延伸到窗口右下角（不做外阴影，所以不留影子边）
 function applyPanelShape() {
   if (!panelAlive() || !panelMode) return;
   const f = panelFrame();
   const r = panelVisibleRect();
-  const x = Math.max(0, r.x - SHADOW_PAD);
-  const y = Math.max(0, r.y - SHADOW_PAD);
+  const { x, y } = r;
   panelWin.setShape([{ x, y, width: f.width - x, height: f.height - y }]);
   repositionReceive();
 }

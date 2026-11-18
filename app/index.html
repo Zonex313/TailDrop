@@ -38,14 +38,13 @@
     -webkit-font-smoothing: antialiased;
   }
 
-  /* ---------- 舞台：负责阴影、弹出和退场 ---------- */
-  /* 阴影用 drop-shadow 画在外层，它会跟着里面卡片的裁剪形状走，展开时阴影也一起长大 */
+  /* ---------- 舞台：负责弹出和退场 ---------- */
+  /* 不加外阴影：窗口可见区域是硬边，阴影画到边界上会被直切成一条暗带 */
   #stage {
     position: absolute;
     right: var(--gap);
     bottom: var(--gap);
     width: 280px;
-    filter: drop-shadow(0 12px 28px rgba(0, 0, 0, .5)) drop-shadow(0 2px 6px rgba(0, 0, 0, .35));
     /* 缩放原点钉在右下角：图标就从右下角长出来，收回去时也缩回右下角 */
     transform-origin: 100% 100%;
     opacity: 0;
