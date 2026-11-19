@@ -4,7 +4,7 @@
 // （官方命令行显示进度用的也是这个数据）。总线由 bus.js 统一维护，这里只订阅。
 // 读不到广播时照常发送，只是界面上没有百分比。
 
-const { spawn } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
@@ -16,11 +16,27 @@ const STALL_MS = 60 * 1000;               // 有进度数据时：这么久没�
 const BLIND_TIMEOUT_MS = 30 * 60 * 1000;  // 完全读不到进度时的兜底超时
 const PUSH_EVERY_MS = 1000;               // 给对方 TailDrop 推进度的间隔
 const PUSH_GIVE_UP = 3;                   // 连续推不过去几次就放弃（对方没装 TailDrop）
+const TARGETS_TTL_MS = 30 * 1000;         // 「哪些设备能收文件」的查询结果缓存多久
 
 function createSender(tailscaleExe, bus, emit) {
   const queue = [];
   let busy = false;
   let current = null;     // 正在发送的任务，面板重新打开时用来恢复进度显示
+  let targets = null;     // { at, addrs:Set }：tailscale file cp --targets 的结果
+
+  // 先问 Tailscale 这台设备能不能收文件，能收才把文件清单推给对方（避免清单先于权限检查送出去）
+  function canReceive(dev) {
+    if (!dev.addr) return Promise.resolve(false);
+    if (targets && Date.now() - targets.at < TARGETS_TTL_MS) return Promise.resolve(targets.addrs.has(dev.addr));
+    return new Promise((resolve) => {
+      execFile(tailscaleExe, ['file', 'cp', '--targets'], { timeout: 5000, windowsHide: true }, (err, stdout) => {
+        if (err) { resolve(false); return; }
+        const addrs = new Set(String(stdout).split(/\r?\n/).map((l) => l.split('\t')[0].trim()).filter(Boolean));
+        targets = { at: Date.now(), addrs };
+        resolve(addrs.has(dev.addr));
+      });
+    });
+  }
 
   function enqueue(files, dev) {
     if (!dev || !files.length) return false;
@@ -47,8 +63,9 @@ function createSender(tailscaleExe, bus, emit) {
   async function runJob({ files, dev }) {
     const sizes = files.map(fileSize);
     const total = sizes.reduce((a, b) => a + b, 0);
-    const job = { dev, total, doneBytes: 0, file: null, sent: 0, speed: 0, lastSentAt: 0, lastSentBytes: 0, seen: false, lastAdvance: 0 };
-    job.push = createPush(dev, files, sizes);
+    const job = { dev, total, doneBytes: 0, file: null, sent: 0, speed: 0, lastSentAt: 0, lastSentBytes: 0, seen: false, lastAdvance: 0, epoch: bus.epoch };
+    const allowed = dev.os === 'windows' ? await canReceive(dev) : false;
+    job.push = createPush(dev, files, sizes, allowed);
     current = job;
     report(job);
 
@@ -62,8 +79,11 @@ function createSender(tailscaleExe, bus, emit) {
         firstError = firstError || e;
         job.push.fail(i);
       }
-      job.doneBytes += sizes[i];
+      // 这个文件结束：当前文件记满，报一次；再并进"已完成"，下一个文件从 0 开始数，进度不会重复计算
+      job.sent = sizes[i];
       report(job);
+      job.doneBytes += sizes[i];
+      job.sent = 0;
     }
 
     await job.push.finish(firstError ? 'error' : 'ok');
@@ -81,6 +101,12 @@ function createSender(tailscaleExe, bus, emit) {
       const started = Date.now();
       const watchdog = setInterval(() => {
         const now = Date.now();
+        // 进度通道（总线）断了或刚重连：先暂停"没进度"的计时，等它恢复后再判断，免得误杀正在传的文件
+        if (!bus.connected || bus.epoch !== job.epoch) {
+          job.epoch = bus.epoch;
+          job.lastAdvance = now;
+          return;
+        }
         const stalled = job.seen ? now - job.lastAdvance > STALL_MS : now - started > BLIND_TIMEOUT_MS;
         if (stalled) {
           clearInterval(watchdog);
@@ -104,7 +130,8 @@ function createSender(tailscaleExe, bus, emit) {
     if (!job || !job.file) return;
     for (const of of msg.OutgoingFiles || []) {
       if (of.Finished || of.PeerID !== job.dev.id) continue;
-      if (decodeName(of.Name) !== path.basename(job.file)) continue;
+      const base = path.basename(job.file);
+      if (of.Name !== base && decodeName(of.Name) !== base) continue;
       job.seen = true;
       if (of.Sent > job.sent) {
         const now = Date.now();
@@ -139,8 +166,8 @@ function createSender(tailscaleExe, bus, emit) {
 
 // 对方也是装了 TailDrop 的 Windows 电脑时，把进度推给它，让它的接收条显示文件名和百分比。
 // 推送失败不影响发送本身。
-function createPush(dev, files, sizes) {
-  const enabled = dev.os === 'windows' && !!dev.addr;
+function createPush(dev, files, sizes, allowed) {
+  const enabled = !!allowed && dev.os === 'windows' && !!dev.addr;
   const base = {
     v: 1,
     id: crypto.randomUUID(),
@@ -157,7 +184,9 @@ function createPush(dev, files, sizes) {
     if (!enabled || fails >= PUSH_GIVE_UP) return Promise.resolve();
     const p = postProgress(dev.addr, { ...base, ...last, state, failed: failed.slice() })
       .then((ok) => { fails = ok ? 0 : fails + 1; });
-    inflight = p.finally(() => { if (inflight === p) inflight = null; });
+    // 记下 finally 返回的那个 Promise 本身，结束时才能认出是同一次请求并清掉标记
+    const tracked = p.finally(() => { if (inflight === tracked) inflight = null; });
+    inflight = tracked;
     return p;
   }
 
@@ -190,7 +219,7 @@ function fileSize(f) {
   try { return fs.statSync(f).size; } catch { return 0; }
 }
 
-// 总线里的文件名是 URL 编码的（中文会变成 %E6%B5%8B…）
+// 发送进度里的文件名有时是 URL 编码的（中文会变成 %E6%B5%8B…），所以原样和解码后都比一次
 function decodeName(name) {
   try { return decodeURIComponent(name); } catch { return name; }
 }

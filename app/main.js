@@ -44,6 +44,7 @@ let panelWin = null;
 let hideTimer = null;
 let showTimer = null;
 let panelTimers = [];
+let panelBusHeld = false;   // 面板自己是否占着一份总线引用（只释放自己申请的那份）
 let lastOutsideHideAt = 0;
 let panelClosing = false;
 let panelMode = null;               // 'icon'：拖拽中的小图标；'full'：完整设备列表
@@ -245,8 +246,9 @@ function showReceive(list) {
   win.setAlwaysOnTop(true, 'screen-saver');
   win.loadFile(path.join(__dirname, 'receive.html'));
 
+  // 页面加载期间状态可能已经变了（比如小文件已经收完），所以发最新的，而不是建窗口时那份
   win.webContents.on('did-finish-load', () => {
-    win.webContents.send('receive-progress', list);
+    win.webContents.send('receive-progress', lastReceiveList);
   });
   win.on('closed', () => {
     if (receiveWin !== win) return;
@@ -464,8 +466,8 @@ function watchDevices() {
 }
 
 function startPanelTimers() {
-  stopPanelTimers();
-  bus.start();
+  clearPanelTimers();
+  if (!panelBusHeld) { bus.start(); panelBusHeld = true; }
   devices.refresh();                                   // 上一次总线可能已经退回，先查一次
   devices.probe();                                     // 立刻测线路，别等第一个 3 秒节拍
   panelTimers.push(setInterval(() => devices.probe(), PROBE_TICK_MS));
@@ -473,10 +475,14 @@ function startPanelTimers() {
   if (mouse) panelTimers.push(watchOutsideClick());
 }
 
-function stopPanelTimers() {
+function clearPanelTimers() {
   panelTimers.forEach(clearInterval);
   panelTimers = [];
-  bus.stop();
+}
+
+function stopPanelTimers() {
+  clearPanelTimers();
+  if (panelBusHeld) { bus.stop(); panelBusHeld = false; }
 }
 
 // 面板开着时，在面板外按下任意鼠标键就收起。

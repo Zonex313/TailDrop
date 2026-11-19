@@ -42,8 +42,9 @@ function createNotifyServer(onProgress) {
 
   // 地址变了（Tailscale 重新登录等）就换绑；绑不上下次再试
   function bind(addr) {
-    if (!addr || addr === boundAddr) return;
+    if (addr === boundAddr) return;
     close();
+    if (!addr) return;            // 本机没有 Tailscale 地址了（退出账号等）：只关不开
     const s = http.createServer(handle);
     s.on('error', () => { if (server === s) { server = null; boundAddr = ''; } });
     s.listen(NOTIFY_PORT, addr);

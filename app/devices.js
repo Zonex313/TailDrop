@@ -30,6 +30,7 @@ function createDeviceSource(tailscaleExe, bus) {
   let selfAddr = '';               // 本机的 Tailscale IPv4（100.x）
   let refreshTimer = null;
   let refreshing = false;
+  let refreshAgain = false;        // 查询进行中又有变化：这次查完马上补查一次
 
   function run(args, timeout = 8000) {
     return new Promise((resolve) => {
@@ -43,7 +44,8 @@ function createDeviceSource(tailscaleExe, bus) {
   // 把 status 里的 Peer 表转成面板要的列表
   function apply(status) {
     const now = Date.now();
-    selfAddr = ((status.Self && status.Self.TailscaleIPs) || []).find((ip) => !ip.includes(':')) || selfAddr;
+    // 退出账号 / 断开时 Self 没有地址：清空，让通知服务关掉旧地址上的监听
+    selfAddr = ((status.Self && status.Self.TailscaleIPs) || []).find((ip) => !ip.includes(':')) || '';
     cache = Object.values(status.Peer || {})
       .filter((p) => p.Online)                          // 离线设备不显示
       .map((p) => {
@@ -83,8 +85,9 @@ function createDeviceSource(tailscaleExe, bus) {
   }
 
   async function refresh() {
-    if (refreshing) return;
+    if (refreshing) { refreshAgain = true; return; }
     refreshing = true;
+    refreshAgain = false;
     try {
       const { ok, stdout } = await run(['status', '--json']);
       if (!ok) return;
@@ -93,6 +96,7 @@ function createDeviceSource(tailscaleExe, bus) {
       apply(data);
     } finally {
       refreshing = false;
+      if (refreshAgain) { refreshAgain = false; refresh(); }
     }
   }
 

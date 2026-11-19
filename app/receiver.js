@@ -25,8 +25,9 @@ const WARMUP_MS = 5000;                  // 刚启动先只量平时写入量，
 const SPEED_WINDOW_MS = 3000;            // 速度按最近 3 秒算，免得一跳一跳
 const PUSH_STALE_MS = 15000;             // 推送方这么久没消息 → 当它断了
 const PUSH_QUIET_MS = 3000;              // 推送刚结束的这段时间，硬盘计数不另起一行
-const CLAIM_KEEP_MS = 2 * 60 * 1000;     // 推送过的文件名记多久（防止完成通知再显示一遍）
-const BOOT_IGNORE_MS = 3000;             // 刚启动时总线可能带出旧记录，忽略
+const CONFIRM_WAIT_MS = 10000;           // 对方说"传完了"之后，最多等这么久本机的完成通知来确认到账
+const BOOT_IGNORE_MS = 3000;             // 刚启动这段时间，开始时间早于启动的完成记录当旧记录忽略
+const MAX_EXPECTED = 500;
 // 完成通知常常比写盘计数先到（小文件不到 1 秒就收完）：通知到时还没被计数的那部分字节，
 // 之后几拍里看到时要先抵掉，不能当成"又来了一个新文件"
 const CREDIT_MS = 3000;
@@ -37,7 +38,9 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
   const server = createNotifyServer(onPush);
   const seen = new Set();          // 已处理过的完成通知（文件名 + 开始时间）
   const pushes = new Map();        // 电脑→电脑：id -> 会话
-  let claimed = [];                // 推送会话里出现过的文件名 [{ name, at }]
+  // 电脑→电脑：对方说要发的每个文件，等本机 Tailscale 的完成通知来确认真的收到了
+  // [{ sid, i, name, size, peer, confirmed, waitUntil, muted }]
+  let expected = [];
   let done = [];                   // 已接收 / 失败的行，最新的在前
   let disk = null;                 // 手机→电脑：当前这一轮
   let prevIo = null;
@@ -77,7 +80,11 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
     expirePushes(now);
 
     const io = readIo();
-    if (!io) return;
+    if (!io) {
+      // 读不到后台写盘计数（比如 Tailscale 服务停了）：照样按时结束这一轮，别一直挂着"正在接收"
+      if (disk && now - disk.lastActive > IDLE_END_MS) endDisk('noio');
+      return;
+    }
     if (!prevIo || prevIo.pid !== io.pid) { prevIo = io; return; }   // 后台重启过：重新起算
     // 写入 − 读出：收到的数据只写不读；文件收完后被挪进"下载"时是一读一写，正好抵消
     const net = (io.write - prevIo.write) - (io.read - prevIo.read);
@@ -165,18 +172,21 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
   // ---------- 每个文件收完：Tailscale 的完成通知 ----------
 
   function onBus(msg) {
-    if (!msg.IncomingFiles || Date.now() - bootAt < BOOT_IGNORE_MS) return;
+    if (!msg.IncomingFiles) return;
+    const inBoot = Date.now() - bootAt < BOOT_IGNORE_MS;
     let changed = false;
     for (const f of msg.IncomingFiles) {
       if (!f.Done) continue;
       const key = `${f.Name}|${f.Started}`;
       if (seen.has(key)) continue;
       remember(key);
+      // 刚启动时只丢掉"启动前就开始"的旧记录，启动之后才开始的照常提醒
+      if (inBoot && !(Date.parse(f.Started) >= bootAt)) continue;
 
-      const name = decodeName(f.Name);
+      const name = f.Name;   // Tailscale 给的已经是真实文件名，不能再解码（否则 a%20b 会变成 a b）
       const size = f.DeclaredSize > 0 ? f.DeclaredSize : (f.Received || 0);
       dbg.log('bus done', name, size);
-      if (isClaimed(name)) continue;   // 电脑→电脑已经显示过了
+      if (confirmExpected(name, size)) { changed = true; continue; }   // 电脑→电脑的文件：确认到账
 
       // 这个文件还有多少字节没被计数（通知比计数先到）：记账，之后看到时抵掉
       const counted = disk ? disk.received : 0;
@@ -204,32 +214,60 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
 
   function onPush(remote, msg) {
     const now = Date.now();
+    // 只认当前在线设备列表里的电脑；不认识的地址发来的进度一律不显示
+    const dev = devices.cache.find((x) => x.addr === remote);
+    if (!dev) { dbg.log('push ignored, unknown peer', remote); return; }
     let s = pushes.get(msg.id);
     if (!s) {
-      s = { id: msg.id, peer: peerFor(remote, msg.from), muted: false };
+      s = { id: msg.id, peer: toPeer(dev), muted: false };
       pushes.set(msg.id, s);
       dbg.log('push begin', remote, msg.files.length);
       if (disk) endDisk('push');
+      msg.files.forEach((f, i) => expected.push({ sid: s.id, i, name: f.name, size: f.size, peer: s.peer, confirmed: false, waitUntil: 0, muted: false }));
+      if (expected.length > MAX_EXPECTED) expected = expected.slice(-MAX_EXPECTED);
     }
     Object.assign(s, {
       files: msg.files, cur: msg.cur, sent: msg.sent, speed: msg.speed,
       state: msg.state, failed: new Set(msg.failed), at: now,
     });
     lastPushAt = now;
-    for (const f of msg.files) claim(f.name, now);
     if (s.state !== 'progress') finishPush(s, s.files.length);
     publish();
   }
 
   // upto：前多少个文件算收完；超时断开时只认已经传完的那部分
+  // 对方说"已传完"不算数：要等本机 Tailscale 的完成通知确认到账，才显示"已接收"
   function finishPush(s, upto) {
     pushes.delete(s.id);
-    if (s.muted) return;
-    for (let i = 0; i < upto; i++) {
-      const f = s.files[i];
-      const failed = s.failed.has(i) || (s.state === 'error' && !s.failed.size);
-      addDone({ key: `push:${s.id}:${i}`, name: f.name, size: f.size, peer: s.peer, failed });
+    const now = Date.now();
+    for (const e of expected) {
+      if (e.sid !== s.id) continue;
+      e.muted = e.muted || s.muted;
+      if (e.i >= upto) { e.drop = true; continue; }            // 没传到的文件：放开，之后到了按普通方式提醒
+      const failed = s.failed.has(e.i) || (s.state === 'error' && !s.failed.size);
+      if (failed) {
+        if (!e.muted) addDone({ key: `push:${s.id}:${e.i}`, name: e.name, size: e.size, peer: e.peer, failed: true });
+        e.drop = true;
+      } else if (e.confirmed) {
+        if (!e.muted) addDone({ key: `push:${s.id}:${e.i}`, name: e.name, size: e.size, peer: e.peer });
+        e.drop = true;
+      } else {
+        e.waitUntil = now + CONFIRM_WAIT_MS;                  // 等本机完成通知
+      }
     }
+    expected = expected.filter((e) => !e.drop);
+  }
+
+  // 完成通知到了：找对应的那个文件（同名且同大小，每条通知只认一次）
+  function confirmExpected(name, size) {
+    const e = expected.find((x) => !x.confirmed && x.name === name && (!size || !x.size || x.size === size));
+    if (!e) return false;
+    e.confirmed = true;
+    if (e.waitUntil) {                                        // 推送会话已结束，就差这一步
+      if (!e.muted) addDone({ key: `push:${e.sid}:${e.i}`, name: e.name, size: e.size, peer: e.peer });
+      expected = expected.filter((x) => x !== e);
+    }
+    return true;
   }
 
   function expirePushes(now) {
@@ -237,29 +275,24 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
     for (const s of pushes.values()) {
       if (now - s.at > PUSH_STALE_MS) {
         dbg.log('push stale', s.id);
-        finishPush(s, s.cur);
-        // 对方断了，但没传完的文件可能还会继续到达：放开名字，让完成通知照常显示
-        const left = new Set(s.files.slice(s.cur).map((f) => f.name));
-        claimed = claimed.filter((c) => !left.has(c.name));
+        finishPush(s, s.cur);   // 对方断了：没传到的文件放开，之后到了按普通方式提醒
         changed = true;
       }
     }
-    claimed = claimed.filter((c) => now - c.at < CLAIM_KEEP_MS);
+    // 对方说传完了，但等了一阵本机都没收到完成通知：按失败显示
+    const late = expected.filter((e) => e.waitUntil && now > e.waitUntil);
+    if (late.length) {
+      for (const e of late) {
+        if (!e.muted) addDone({ key: `push:${e.sid}:${e.i}`, name: e.name, size: e.size, peer: e.peer, failed: true });
+      }
+      expected = expected.filter((e) => !late.includes(e));
+      changed = true;
+    }
     if (changed) publish();
   }
 
   function pushActive(now) {
     return pushes.size > 0 || now - lastPushAt < PUSH_QUIET_MS;
-  }
-
-  function claim(name, at) {
-    const c = claimed.find((x) => x.name === name);
-    if (c) c.at = at;
-    else claimed.push({ name, at });
-  }
-
-  function isClaimed(name) {
-    return claimed.some((c) => c.name === name);
   }
 
   // ---------- 发送方是谁 ----------
@@ -268,11 +301,6 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
   function guessPeer() {
     const online = devices.cache;
     return online.length === 1 ? toPeer(online[0]) : null;
-  }
-
-  function peerFor(addr, from) {
-    const d = devices.cache.find((x) => x.addr === addr);
-    return d ? toPeer(d) : { name: from || addr, os: 'windows', link: null };
   }
 
   // ---------- 输出给界面 ----------
@@ -285,16 +313,17 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
     const rows = [];
     for (const s of pushes.values()) {
       if (s.muted) continue;
-      for (let i = 0; i < s.cur; i++) {
-        const f = s.files[i];
-        rows.push({ key: `push:${s.id}:${i}`, name: f.name, size: f.size, peer: s.peer, done: !s.failed.has(i), failed: s.failed.has(i) });
-      }
+      for (let i = 0; i < s.cur; i++) rows.push(earlierRow(s, i, s.files[i]));
       const f = s.files[s.cur];
       const received = Math.min(s.sent, f.size);
       rows.unshift({
         key: `push:${s.id}:${s.cur}`, name: f.name, size: f.size, received,
         pct: f.size ? received / f.size : null, speed: s.speed, peer: s.peer, done: false,
       });
+    }
+    for (const e of expected) {        // 对方说传完了、还在等本机确认的文件
+      if (!e.waitUntil || e.muted) continue;
+      rows.unshift({ key: `push:${e.sid}:${e.i}`, name: e.name, size: e.size, received: e.size, pct: 1, speed: 0, peer: e.peer, done: false });
     }
     if (disk && !disk.muted && !disk.between) {
       rows.unshift({
@@ -304,6 +333,15 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
       });
     }
     return rows;
+  }
+
+  // 会话里已经传过去的文件：失败 / 本机已确认到账 / 还在等确认（显示 100%）
+  function earlierRow(s, i, f) {
+    const key = `push:${s.id}:${i}`;
+    if (s.failed.has(i)) return { key, name: f.name, size: f.size, peer: s.peer, done: false, failed: true };
+    const e = expected.find((x) => x.sid === s.id && x.i === i);
+    if (!e || e.confirmed) return { key, name: f.name, size: f.size, peer: s.peer, done: true };
+    return { key, name: f.name, size: f.size, received: f.size, pct: 1, speed: 0, peer: s.peer, done: false };
   }
 
   function publish() {
@@ -319,6 +357,7 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
     done = [];
     if (disk) disk.muted = true;
     for (const s of pushes.values()) s.muted = true;
+    for (const e of expected) e.muted = true;
     lastSig = '[]';
   }
 
@@ -327,11 +366,6 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
 
 function toPeer(d) {
   return { id: d.id, name: d.name, os: d.os, addr: d.addr, link: d.link };
-}
-
-// 总线里的文件名是 URL 编码的（中文会变成 %E6%B5%8B…）
-function decodeName(name) {
-  try { return decodeURIComponent(name); } catch { return name; }
 }
 
 module.exports = { createReceiver };

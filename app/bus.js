@@ -11,21 +11,29 @@ function createBus(tailscaleExe) {
   let child = null;
   let restartTimer = null;
   let started = false;   // 收到第一条有效消息
+  let epoch = 0;         // 每启动一次监听进程就 +1，别的模块据此知道"刚重连过"
 
   function spawnChild() {
     if (child) return;
-    child = spawn(tailscaleExe,
+    clearTimeout(restartTimer);
+    restartTimer = null;
+    epoch++;
+    const c = spawn(tailscaleExe,
       ['debug', 'watch-ipn', '--initial-status', '--initial-outgoing-files', '--peer-changes', '--peer-patches'],
       { windowsHide: true });
-    child.on('error', () => {});
-    child.on('close', () => {
+    child = c;
+    c.on('error', () => {});
+    c.on('close', () => {
+      // 只处理"当前这个"进程的退出；已被换掉的旧进程退出时不能动新进程的状态
+      if (child !== c) return;
       child = null;
       started = false;
       // tailscaled 重启（比如更新 Tailscale）后自动接回来
       if (refs > 0) restartTimer = setTimeout(spawnChild, 1500);
     });
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', jsonStream((msg) => {
+    c.stdout.setEncoding('utf8');
+    c.stdout.on('data', jsonStream((msg) => {
+      if (child !== c) return;
       started = true;
       for (const fn of subscribers) {
         try { fn(msg); } catch { /* 单个订阅出错不影响其他 */ }
@@ -50,6 +58,7 @@ function createBus(tailscaleExe) {
     stop() { refs = Math.max(0, refs - 1); if (refs === 0) killChild(); },
     get running() { return !!child; },
     get connected() { return started; },
+    get epoch() { return epoch; },
   };
 }
 
