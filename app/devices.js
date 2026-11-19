@@ -74,7 +74,8 @@ function createDeviceSource(tailscaleExe, bus) {
     if (msg.InitialStatus) { apply(msg.InitialStatus); return; }
     if (msg.PeersChanged || msg.PeersRemoved || msg.PeerChangedPatch) { scheduleRefresh(); return; }
     // 本机自己的变化（退出 / 登录账号、断开连接、换了地址）：同样重查，通知服务才能跟着关掉或换地址
-    if (msg.State != null || msg.LoginFinished || msg.Prefs) scheduleRefresh();
+    // SelfChange：Tailscale 1.104 起，只有本机信息（比如地址）变化时会单独发这一条
+    if (msg.SelfChange || msg.State != null || msg.LoginFinished || msg.Prefs) scheduleRefresh();
   }
 
   // 一次变化往往连发好几条，合成一次查询

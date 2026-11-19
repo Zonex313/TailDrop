@@ -188,23 +188,28 @@ function openReceiveDir() {
 // 所以按"大小一致、修改时间就在收到的那一刻附近"去认，认不准就只打开文件夹，不乱选中旧文件
 const RECEIVED_MTIME_SLACK_MS = 2 * 60 * 1000;
 const RECEIVED_RENAME_TRIES = 50;
+const RECEIVED_TIE_MS = 1000;             // 两个候选的修改时间离收到时刻差不到这么多，就算分不清
 function findReceivedFile(dir, f) {
   const ext = path.extname(f.name);
   const stem = f.name.slice(0, f.name.length - ext.length);
   const names = [f.name];
   for (let n = 1; n <= RECEIVED_RENAME_TRIES; n++) names.push(`${stem} (${n})${ext}`);
   const at = f.at || Date.now();
-  let best = null;
+  const hits = [];
   for (const name of names) {
     let st;
     try { st = fs.statSync(path.join(dir, name)); } catch { continue; }
     if (!st.isFile()) continue;
-    if (f.size && st.size !== f.size) continue;
+    if (f.size != null && st.size !== f.size) continue;   // 0 字节也是确定的大小，照样要比
     const gap = Math.abs(st.mtimeMs - at);
     if (gap > RECEIVED_MTIME_SLACK_MS) continue;
-    if (!best || gap < best.gap) best = { file: path.join(dir, name), gap };
+    hits.push({ file: path.join(dir, name), gap });
   }
-  return best ? best.file : null;
+  if (!hits.length) return null;
+  hits.sort((a, b) => a.gap - b.gap);
+  // 两个候选差不多一样符合（比如大小、修改时间都相同）：分不清哪个是新的，就只打开文件夹
+  if (hits.length > 1 && hits[1].gap - hits[0].gap < RECEIVED_TIE_MS) return null;
+  return hits[0].file;
 }
 
 function receiveBounds(height) {
