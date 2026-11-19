@@ -16,23 +16,21 @@ const STALL_MS = 60 * 1000;               // 有进度数据时：这么久没�
 const BLIND_TIMEOUT_MS = 30 * 60 * 1000;  // 完全读不到进度时的兜底超时
 const PUSH_EVERY_MS = 1000;               // 给对方 TailDrop 推进度的间隔
 const PUSH_GIVE_UP = 3;                   // 连续推不过去几次就放弃（对方没装 TailDrop）
-const TARGETS_TTL_MS = 30 * 1000;         // 「哪些设备能收文件」的查询结果缓存多久
+const BUS_DOWN_MAX_MS = 5 * 60 * 1000;    // 进度通道累计断开这么久还没恢复，就别再干等了
+const TARGETS_TIMEOUT_MS = 5000;          // 「哪些设备能收文件」查询的超时
 
 function createSender(tailscaleExe, bus, emit) {
   const queue = [];
   let busy = false;
   let current = null;     // 正在发送的任务，面板重新打开时用来恢复进度显示
-  let targets = null;     // { at, addrs:Set }：tailscale file cp --targets 的结果
-
-  // 先问 Tailscale 这台设备能不能收文件，能收才把文件清单推给对方（避免清单先于权限检查送出去）
+  // 先问 Tailscale 这台设备能不能收文件，能收才把文件清单推给对方（避免清单先于权限检查送出去）。
+  // 每笔任务都现查，不用缓存：权限刚被收回时也不会把清单漏出去；查不到一律当不能收
   function canReceive(dev) {
     if (!dev.addr) return Promise.resolve(false);
-    if (targets && Date.now() - targets.at < TARGETS_TTL_MS) return Promise.resolve(targets.addrs.has(dev.addr));
     return new Promise((resolve) => {
-      execFile(tailscaleExe, ['file', 'cp', '--targets'], { timeout: 5000, windowsHide: true }, (err, stdout) => {
+      execFile(tailscaleExe, ['file', 'cp', '--targets'], { timeout: TARGETS_TIMEOUT_MS, windowsHide: true }, (err, stdout) => {
         if (err) { resolve(false); return; }
         const addrs = new Set(String(stdout).split(/\r?\n/).map((l) => l.split('\t')[0].trim()).filter(Boolean));
-        targets = { at: Date.now(), addrs };
         resolve(addrs.has(dev.addr));
       });
     });
@@ -98,20 +96,31 @@ function createSender(tailscaleExe, bus, emit) {
       let stderr = '';
       child.stderr.on('data', (d) => { stderr += d; });
 
-      const started = Date.now();
+      // 三个计时分开算：有进度时多久没前进 / 没进度时连着多久 / 进度通道一共断了多久
+      let blindFrom = Date.now();
+      let offlineMs = 0;
+      let lastTick = Date.now();
       const watchdog = setInterval(() => {
         const now = Date.now();
-        // 进度通道（总线）断了或刚重连：先暂停"没进度"的计时，等它恢复后再判断，免得误杀正在传的文件
-        if (!bus.connected || bus.epoch !== job.epoch) {
+        const step = now - lastTick;
+        lastTick = now;
+        let why = null;
+        if (!bus.connected) {
+          // 进度通道断了：不按"没进度"判，但断太久（累计）也不能让队列一直卡着
+          offlineMs += step;
+          if (offlineMs > BUS_DOWN_MAX_MS) why = '读不到发送进度太久，已停止发送';
+        } else if (bus.epoch !== job.epoch) {
+          // 刚重连：从现在起重新计时，不拿断线前的时间算超时
           job.epoch = bus.epoch;
           job.lastAdvance = now;
-          return;
+          blindFrom = now;
+        } else if (job.seen ? now - job.lastAdvance > STALL_MS : now - blindFrom > BLIND_TIMEOUT_MS) {
+          why = '对方没有响应，已停止发送';
         }
-        const stalled = job.seen ? now - job.lastAdvance > STALL_MS : now - started > BLIND_TIMEOUT_MS;
-        if (stalled) {
+        if (why) {
           clearInterval(watchdog);
           child.kill();
-          reject(new Error('对方没有响应，已停止发送'));
+          reject(new Error(why));
         }
       }, 1000);
 

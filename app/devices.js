@@ -72,7 +72,9 @@ function createDeviceSource(tailscaleExe, bus) {
   // 总线上"有变化"的消息类型；进度类（OutgoingFiles 等）不在这里处理
   function onMessage(msg) {
     if (msg.InitialStatus) { apply(msg.InitialStatus); return; }
-    if (msg.PeersChanged || msg.PeersRemoved || msg.PeerChangedPatch) scheduleRefresh();
+    if (msg.PeersChanged || msg.PeersRemoved || msg.PeerChangedPatch) { scheduleRefresh(); return; }
+    // 本机自己的变化（退出 / 登录账号、断开连接、换了地址）：同样重查，通知服务才能跟着关掉或换地址
+    if (msg.State != null || msg.LoginFinished || msg.Prefs) scheduleRefresh();
   }
 
   // 一次变化往往连发好几条，合成一次查询

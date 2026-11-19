@@ -26,7 +26,7 @@ const SPEED_WINDOW_MS = 3000;            // 速度按最近 3 秒算，免得一
 const PUSH_STALE_MS = 15000;             // 推送方这么久没消息 → 当它断了
 const PUSH_QUIET_MS = 3000;              // 推送刚结束的这段时间，硬盘计数不另起一行
 const CONFIRM_WAIT_MS = 10000;           // 对方说"传完了"之后，最多等这么久本机的完成通知来确认到账
-const BOOT_IGNORE_MS = 3000;             // 刚启动这段时间，开始时间早于启动的完成记录当旧记录忽略
+const ARRIVAL_KEEP_MS = 30 * 1000;       // 本机先收完、对方的进度消息后到：这段时间内还能对上号
 const MAX_EXPECTED = 500;
 // 完成通知常常比写盘计数先到（小文件不到 1 秒就收完）：通知到时还没被计数的那部分字节，
 // 之后几拍里看到时要先抵掉，不能当成"又来了一个新文件"
@@ -41,7 +41,8 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
   // 电脑→电脑：对方说要发的每个文件，等本机 Tailscale 的完成通知来确认真的收到了
   // [{ sid, i, name, size, peer, confirmed, waitUntil, muted }]
   let expected = [];
-  let done = [];                   // 已接收 / 失败的行，最新的在前
+  let arrivals = [];               // 本机已收完、还没对上推送会话的文件 [{ name, size, at, rowKey }]
+  let done = [];                   // 已接收 / 失败 / 未确认的行，最新的在前
   let disk = null;                 // 手机→电脑：当前这一轮
   let prevIo = null;
   let streak = 0;
@@ -172,16 +173,15 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
   // ---------- 每个文件收完：Tailscale 的完成通知 ----------
 
   function onBus(msg) {
+    // 总线只在实时变化时才带 IncomingFiles（启动时的初始快照里没有这一项，已实测），
+    // 所以这里收到的完成记录都是刚发生的，包括启动前开始、启动后才收完的文件
     if (!msg.IncomingFiles) return;
-    const inBoot = Date.now() - bootAt < BOOT_IGNORE_MS;
     let changed = false;
     for (const f of msg.IncomingFiles) {
       if (!f.Done) continue;
       const key = `${f.Name}|${f.Started}`;
       if (seen.has(key)) continue;
       remember(key);
-      // 刚启动时只丢掉"启动前就开始"的旧记录，启动之后才开始的照常提醒
-      if (inBoot && !(Date.parse(f.Started) >= bootAt)) continue;
 
       const name = f.Name;   // Tailscale 给的已经是真实文件名，不能再解码（否则 a%20b 会变成 a b）
       const size = f.DeclaredSize > 0 ? f.DeclaredSize : (f.Received || 0);
@@ -198,11 +198,22 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
         disk.samples = [{ t: Date.now(), c: 0 }];
         disk.between = true;
       }
-      if (disk && disk.muted) continue;   // 这一轮被手动关掉了，传完也不再弹
-      addDone({ key: `done:${key}`, name, size, peer: disk ? disk.peer : guessPeer() });
+      if (disk && disk.muted) {           // 这一轮被手动关掉了，传完也不再弹
+        rememberArrival(name, size, null);
+        continue;
+      }
+      const rowKey = `done:${key}`;
+      addDone({ key: rowKey, name, size, peer: disk ? disk.peer : guessPeer() });
+      rememberArrival(name, size, rowKey);
       changed = true;
     }
     if (changed) publish();
+  }
+
+  // 记下"本机已收完"：电脑→电脑时对方的进度消息可能比完成通知晚到，到时候拿来对号
+  function rememberArrival(name, size, rowKey) {
+    const now = Date.now();
+    arrivals = [...arrivals.filter((a) => now - a.at < ARRIVAL_KEEP_MS), { name, size, at: now, rowKey }];
   }
 
   function remember(key) {
@@ -230,6 +241,7 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
       files: msg.files, cur: msg.cur, sent: msg.sent, speed: msg.speed,
       state: msg.state, failed: new Set(msg.failed), at: now,
     });
+    claimArrivals(s);
     lastPushAt = now;
     if (s.state !== 'progress') finishPush(s, s.files.length);
     publish();
@@ -243,13 +255,16 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
     for (const e of expected) {
       if (e.sid !== s.id) continue;
       e.muted = e.muted || s.muted;
+      // 本机已确认到账的文件：不管对方最后报到第几个（比如结束消息丢了、超时断开），都照实显示"已接收"
+      if (e.confirmed) {
+        if (!e.muted) addDone({ key: `push:${s.id}:${e.i}`, name: e.name, size: e.size, peer: e.peer });
+        e.drop = true;
+        continue;
+      }
       if (e.i >= upto) { e.drop = true; continue; }            // 没传到的文件：放开，之后到了按普通方式提醒
       const failed = s.failed.has(e.i) || (s.state === 'error' && !s.failed.size);
       if (failed) {
         if (!e.muted) addDone({ key: `push:${s.id}:${e.i}`, name: e.name, size: e.size, peer: e.peer, failed: true });
-        e.drop = true;
-      } else if (e.confirmed) {
-        if (!e.muted) addDone({ key: `push:${s.id}:${e.i}`, name: e.name, size: e.size, peer: e.peer });
         e.drop = true;
       } else {
         e.waitUntil = now + CONFIRM_WAIT_MS;                  // 等本机完成通知
@@ -258,9 +273,49 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
     expected = expected.filter((e) => !e.drop);
   }
 
-  // 完成通知到了：找对应的那个文件（同名且同大小，每条通知只认一次）
+  // 本机先收完、对方的进度后到：把先记下的到账对上这个会话，单独弹过的那行换成带发送方的这一行
+  function claimArrivals(s) {
+    if (!arrivals.length) return;
+    const now = Date.now();
+    arrivals = arrivals.filter((a) => now - a.at < ARRIVAL_KEEP_MS);
+    for (const a of arrivals.slice()) {
+      const e = expected.find((x) => x.sid === s.id && !x.confirmed && x.name === a.name
+        && sizeFits(a.size, x.size) && x.i <= s.cur);
+      if (!e) continue;
+      e.confirmed = true;
+      arrivals = arrivals.filter((x) => x !== a);
+      if (a.rowKey) done = done.filter((r) => r.key !== a.rowKey);
+      else e.muted = true;                    // 那一行当初就没弹（被手动关了），现在也不弹
+    }
+  }
+
+  // 大小对不对得上：续传时完成通知里的大小可能只是这次补传的部分，所以"不超过清单大小"也算
+  function sizeFits(got, want) {
+    return !got || !want || got <= want;
+  }
+
+  // 这个文件对方已经开始发了吗：还在排队、没轮到的文件不可能先到账
+  function started(e) {
+    if (e.waitUntil) return true;
+    const s = pushes.get(e.sid);
+    return !s || e.i <= s.cur;
+  }
+
+  // 同名的候选里优先挑大小完全一致的，其次才是续传那种"小于清单"的
+  function pickExpected(name, size) {
+    const cands = expected.filter((x) => !x.confirmed && x.name === name && sizeFits(size, x.size) && started(x));
+    if (!cands.length) return null;
+    const exact = cands.filter((x) => !size || !x.size || x.size === size);
+    const pool = exact.length ? exact : cands;
+    const e = pool[0];
+    // 两台电脑同时发了同名文件、分不清是谁的：这一行不写发送方，免得张冠李戴
+    if (new Set(pool.map((x) => x.sid)).size > 1) e.peer = null;
+    return e;
+  }
+
+  // 完成通知到了：找对应的那个文件（每条通知只认一次）
   function confirmExpected(name, size) {
-    const e = expected.find((x) => !x.confirmed && x.name === name && (!size || !x.size || x.size === size));
+    const e = pickExpected(name, size);
     if (!e) return false;
     e.confirmed = true;
     if (e.waitUntil) {                                        // 推送会话已结束，就差这一步
@@ -279,11 +334,11 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
         changed = true;
       }
     }
-    // 对方说传完了，但等了一阵本机都没收到完成通知：按失败显示
+    // 对方说传完了，但等了一阵本机都没收到完成通知：不一定是失败（可能只是通知丢了），显示"未确认"
     const late = expected.filter((e) => e.waitUntil && now > e.waitUntil);
     if (late.length) {
       for (const e of late) {
-        if (!e.muted) addDone({ key: `push:${e.sid}:${e.i}`, name: e.name, size: e.size, peer: e.peer, failed: true });
+        if (!e.muted) addDone({ key: `push:${e.sid}:${e.i}`, name: e.name, size: e.size, peer: e.peer, unconfirmed: true });
       }
       expected = expected.filter((e) => !late.includes(e));
       changed = true;
@@ -306,7 +361,7 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
   // ---------- 输出给界面 ----------
 
   function addDone(row) {
-    done = [{ ...row, done: !row.failed }, ...done].slice(0, MAX_DONE_ROWS);
+    done = [{ ...row, done: !row.failed && !row.unconfirmed, at: Date.now() }, ...done].slice(0, MAX_DONE_ROWS);
   }
 
   function activeRows() {
@@ -315,6 +370,11 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
       if (s.muted) continue;
       for (let i = 0; i < s.cur; i++) rows.push(earlierRow(s, i, s.files[i]));
       const f = s.files[s.cur];
+      const cur = expected.find((x) => x.sid === s.id && x.i === s.cur);
+      if (cur && cur.confirmed) {                // 本机已经确认收完，就不再显示对方报的进度
+        rows.unshift(earlierRow(s, s.cur, f));
+        continue;
+      }
       const received = Math.min(s.sent, f.size);
       rows.unshift({
         key: `push:${s.id}:${s.cur}`, name: f.name, size: f.size, received,
@@ -340,7 +400,9 @@ function createReceiver(bus, devices, emit, { readIo = readTailscaledIo } = {}) 
     const key = `push:${s.id}:${i}`;
     if (s.failed.has(i)) return { key, name: f.name, size: f.size, peer: s.peer, done: false, failed: true };
     const e = expected.find((x) => x.sid === s.id && x.i === i);
-    if (!e || e.confirmed) return { key, name: f.name, size: f.size, peer: s.peer, done: true };
+    // 记录找不到（太多文件被挤掉了）：没法确认到账，不能说"已接收"
+    if (!e) return { key, name: f.name, size: f.size, peer: s.peer, done: false, unconfirmed: true };
+    if (e.confirmed) return { key, name: f.name, size: f.size, peer: e.peer === null ? null : s.peer, done: true };
     return { key, name: f.name, size: f.size, received: f.size, pct: 1, speed: 0, peer: s.peer, done: false };
   }
 

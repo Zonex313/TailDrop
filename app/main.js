@@ -164,7 +164,7 @@ function onReceiveEvent(list) {
   showReceive(list);
 
   // 全部传完（或失败）后停留一会儿；还有在传的就一直开着
-  const finished = list.every((f) => f.done || f.failed);
+  const finished = list.every((f) => f.done || f.failed || f.unconfirmed);
   if (finished) scheduleReceiveHide(RECEIVE_HOLD_MS);
 }
 
@@ -179,9 +179,32 @@ function cursorInReceive() {
 function openReceiveDir() {
   const dir = app.getPath('downloads');
   const latest = lastReceiveList.find((f) => f.done && f.name);
-  const file = latest && path.join(dir, latest.name);
-  if (file && fs.existsSync(file)) shell.showItemInFolder(file);
+  const file = latest && findReceivedFile(dir, latest);
+  if (file) shell.showItemInFolder(file);
   else shell.openPath(dir);
+}
+
+// 找到这次真正收到的那个文件：重名时 Tailscale 会存成「名字 (1).扩展名」，
+// 所以按"大小一致、修改时间就在收到的那一刻附近"去认，认不准就只打开文件夹，不乱选中旧文件
+const RECEIVED_MTIME_SLACK_MS = 2 * 60 * 1000;
+const RECEIVED_RENAME_TRIES = 50;
+function findReceivedFile(dir, f) {
+  const ext = path.extname(f.name);
+  const stem = f.name.slice(0, f.name.length - ext.length);
+  const names = [f.name];
+  for (let n = 1; n <= RECEIVED_RENAME_TRIES; n++) names.push(`${stem} (${n})${ext}`);
+  const at = f.at || Date.now();
+  let best = null;
+  for (const name of names) {
+    let st;
+    try { st = fs.statSync(path.join(dir, name)); } catch { continue; }
+    if (!st.isFile()) continue;
+    if (f.size && st.size !== f.size) continue;
+    const gap = Math.abs(st.mtimeMs - at);
+    if (gap > RECEIVED_MTIME_SLACK_MS) continue;
+    if (!best || gap < best.gap) best = { file: path.join(dir, name), gap };
+  }
+  return best ? best.file : null;
 }
 
 function receiveBounds(height) {

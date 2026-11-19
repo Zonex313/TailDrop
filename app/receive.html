@@ -197,6 +197,11 @@
   .row.failed::before { opacity: 0; }
   .row.failed .pct { color: rgb(248, 113, 113); }
   .row.failed .avatar { border-color: rgba(248, 113, 113, .45); color: rgb(248, 113, 113); }
+
+  /* 对方说传完了，但本机没等到到账确认：不算失败，琥珀色提示去文件夹看一眼 */
+  .row.unconfirmed { border-color: rgba(251, 191, 36, .4); background: rgba(251, 191, 36, .04); }
+  .row.unconfirmed::before { opacity: 0; }
+  .row.unconfirmed .pct { color: rgb(251, 191, 36); }
 </style>
 </head>
 <body>
@@ -287,7 +292,7 @@
       const parts = [];
       if (peer.os) parts.push(osLabel[peer.os] || peer.os);
       if (peer.link && peer.link.confirmed !== false) parts.push(linkLabel[peer.link.kind] || '');
-      if (f.done || f.failed || f.unknown) {
+      if (f.done || f.failed || f.unconfirmed || f.unknown) {
         // 传完了 / 文件名未知：大小显示在右侧，副标题不再重复
       } else if (f.size) {
         parts.push(`${fmtSizeTight(f.received || 0)}/${fmtSizeTight(f.size)}`);
@@ -298,7 +303,12 @@
 
       const pctEl = row.querySelector('.pct');
       const speedEl = row.querySelector('.speed');
-      if (f.failed) {
+      if (f.unconfirmed) {
+        row.classList.remove('waiting', 'done', 'failed');
+        row.classList.add('unconfirmed');
+        pctEl.textContent = '未确认';
+        speedEl.textContent = fmtSize(f.size || 0);
+      } else if (f.failed) {
         row.classList.remove('waiting', 'done');
         row.classList.add('failed');
         pctEl.textContent = '失败';
@@ -335,7 +345,7 @@
     // 标题栏显示发送方：多台设备同时发时只写"N 台设备"；不知道是谁就不写
     const senders = [...new Set(list.map((f) => (f.peer && f.peer.name) || '').filter(Boolean))];
     fromEl.textContent = senders.length === 1 ? `from ${senders[0]}` : senders.length > 1 ? `${senders.length} 台设备` : '';
-    titleEl.textContent = list.every((f) => f.done || f.failed) ? 'Received' : 'Receiving';
+    titleEl.textContent = list.every((f) => f.done || f.failed || f.unconfirmed) ? 'Received' : 'Receiving';
 
     if (list.some((f) => f.done)) showedDoneAt = Date.now();
   }
